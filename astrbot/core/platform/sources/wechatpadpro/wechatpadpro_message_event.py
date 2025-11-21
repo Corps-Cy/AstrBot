@@ -12,6 +12,7 @@ from astrbot.core.message.components import (
     Image,
     Plain,
     Record,
+    Video,
     WechatEmoji,
 )  # Import Image
 from astrbot.core.message.message_event_result import MessageChain
@@ -49,6 +50,8 @@ class WeChatPadProMessageEvent(AstrMessageEvent):
                     await self._send_emoji(session, comp)
                 elif isinstance(comp, Record):
                     await self._send_voice(session, comp)
+                elif isinstance(comp, Video):
+                    await self._send_video(session, comp)
         await super().send(message)
 
     async def send_streaming(
@@ -139,6 +142,26 @@ class WeChatPadProMessageEvent(AstrMessageEvent):
         }
         url = f"{self.adapter.base_url}/message/SendVoice"
         await self._post(session, url, payload)
+
+    async def _send_video(self, session: aiohttp.ClientSession, comp: Video):
+        """发送视频消息"""
+        try:
+            video_path = await comp.convert_to_file_path()
+            # 读取视频文件并转换为 base64
+            with open(video_path, "rb") as f:
+                video_data = f.read()
+                video_b64 = base64.b64encode(video_data).decode()
+            
+            payload = {
+                "ToUserName": self.session_id,
+                "VideoData": video_b64,
+                "MsgType": 43,  # 微信视频消息类型
+            }
+            url = f"{self.adapter.base_url}/message/SendVideoMessage"
+            await self._post(session, url, payload)
+            logger.debug(f"微信个人号发送视频: {video_path}")
+        except Exception as e:
+            logger.error(f"微信个人号发送视频失败: {e}")
 
     @staticmethod
     def _validate_base64(b64: str) -> bytes:

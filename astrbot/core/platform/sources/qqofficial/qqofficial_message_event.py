@@ -16,7 +16,7 @@ from botpy.types.message import Media
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
-from astrbot.api.message_components import Image, Plain, Record
+from astrbot.api.message_components import Image, Plain, Record, Video
 from astrbot.api.platform import AstrBotMessage, PlatformMetadata
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from astrbot.core.utils.io import download_image_by_url, file_to_base64
@@ -96,6 +96,7 @@ class QQOfficialMessageEvent(AstrMessageEvent):
             image_base64,
             image_path,
             record_file_path,
+            video_file_path,
         ) = await QQOfficialMessageEvent._parse_to_qqofficial(self.send_buffer)
 
         if (
@@ -103,6 +104,7 @@ class QQOfficialMessageEvent(AstrMessageEvent):
             and not image_base64
             and not image_path
             and not record_file_path
+            and not video_file_path
         ):
             return None
 
@@ -116,68 +118,97 @@ class QQOfficialMessageEvent(AstrMessageEvent):
 
         ret = None
 
-        match type(source):
-            case botpy.message.GroupMessage:
-                if image_base64:
-                    media = await self.upload_group_and_c2c_image(
-                        image_base64,
-                        1,
-                        group_openid=source.group_openid,
-                    )
-                    payload["media"] = media
-                    payload["msg_type"] = 7
-                if record_file_path:  # group record msg
-                    media = await self.upload_group_and_c2c_record(
-                        record_file_path,
-                        3,
-                        group_openid=source.group_openid,
-                    )
-                    payload["media"] = media
-                    payload["msg_type"] = 7
-                ret = await self.bot.api.post_group_message(
+        if isinstance(source, botpy.message.GroupMessage):
+            if image_base64:
+                media = await self.upload_group_and_c2c_image(
+                    image_base64,
+                    1,
                     group_openid=source.group_openid,
-                    **payload,
                 )
-            case botpy.message.C2CMessage:
-                if image_base64:
-                    media = await self.upload_group_and_c2c_image(
-                        image_base64,
-                        1,
-                        openid=source.author.user_openid,
-                    )
+                payload["media"] = media
+                payload["msg_type"] = 7
+            if record_file_path:  # group record msg
+                media = await self.upload_group_and_c2c_record(
+                    record_file_path,
+                    3,
+                    group_openid=source.group_openid,
+                )
+                payload["media"] = media
+                payload["msg_type"] = 7
+            if video_file_path:  # group video msg
+                media = await self.upload_group_and_c2c_record(
+                    video_file_path,
+                    2,
+                    group_openid=source.group_openid,
+                )
+                if media:
                     payload["media"] = media
                     payload["msg_type"] = 7
-                if record_file_path:  # c2c record
-                    media = await self.upload_group_and_c2c_record(
-                        record_file_path,
-                        3,
-                        openid=source.author.user_openid,
-                    )
+            ret = await self.bot.api.post_group_message(
+                group_openid=source.group_openid,
+                **payload,
+            )
+        elif isinstance(source, botpy.message.C2CMessage):
+            if image_base64:
+                media = await self.upload_group_and_c2c_image(
+                    image_base64,
+                    1,
+                    openid=source.author.user_openid,
+                )
+                payload["media"] = media
+                payload["msg_type"] = 7
+            if record_file_path:  # c2c record
+                media = await self.upload_group_and_c2c_record(
+                    record_file_path,
+                    3,
+                    openid=source.author.user_openid,
+                )
+                payload["media"] = media
+                payload["msg_type"] = 7
+            if video_file_path:  # c2c video msg
+                media = await self.upload_group_and_c2c_record(
+                    video_file_path,
+                    2,
+                    openid=source.author.user_openid,
+                )
+                if media:
                     payload["media"] = media
                     payload["msg_type"] = 7
-                if stream:
-                    ret = await self.post_c2c_message(
-                        openid=source.author.user_openid,
-                        **payload,
-                        stream=stream,
-                    )
-                else:
-                    ret = await self.post_c2c_message(
-                        openid=source.author.user_openid,
-                        **payload,
-                    )
-                logger.debug(f"Message sent to C2C: {ret}")
-            case botpy.message.Message:
-                if image_path:
-                    payload["file_image"] = image_path
-                ret = await self.bot.api.post_message(
-                    channel_id=source.channel_id,
+            if stream:
+                ret = await self.post_c2c_message(
+                    openid=source.author.user_openid,
+                    **payload,
+                    stream=stream,
+                )
+            else:
+                ret = await self.post_c2c_message(
+                    openid=source.author.user_openid,
                     **payload,
                 )
-            case botpy.message.DirectMessage:
-                if image_path:
-                    payload["file_image"] = image_path
-                ret = await self.bot.api.post_dms(guild_id=source.guild_id, **payload)
+            logger.debug(f"Message sent to C2C: {ret}")
+        elif isinstance(source, botpy.message.Message):
+            if image_path:
+                payload["file_image"] = image_path
+            if video_file_path:
+                # 频道消息可能不支持视频，尝试使用 file_image 参数
+                logger.warning(
+                    "频道消息的视频支持可能有限，尝试使用 file_image 参数发送视频",
+                )
+                payload["file_image"] = video_file_path
+            ret = await self.bot.api.post_message(
+                channel_id=source.channel_id,
+                **payload,
+            )
+        elif isinstance(source, botpy.message.DirectMessage):
+            if image_path:
+                payload["file_image"] = image_path
+            if video_file_path:
+                # 私信可能不支持视频，尝试使用 file_image 参数
+                logger.warning(
+                    "私信的视频支持可能有限，尝试使用 file_image 参数发送视频",
+                )
+                payload["file_image"] = video_file_path
+            ret = await self.bot.api.post_dms(guild_id=source.guild_id, **payload)
 
         await super().send(self.send_buffer)
 
@@ -288,6 +319,7 @@ class QQOfficialMessageEvent(AstrMessageEvent):
         image_base64 = None  # only one img supported
         image_file_path = None
         record_file_path = None
+        video_file_path = None
         for i in message.chain:
             if isinstance(i, Plain):
                 plain_text += i.text
@@ -324,6 +356,14 @@ class QQOfficialMessageEvent(AstrMessageEvent):
                     except Exception as e:
                         logger.error(f"处理语音时出错: {e}")
                         record_file_path = None
+            elif isinstance(i, Video):
+                if i.file:
+                    try:
+                        video_file_path = await i.convert_to_file_path()
+                        logger.debug(f"视频文件路径: {video_file_path}")
+                    except Exception as e:
+                        logger.error(f"处理视频时出错: {e}")
+                        video_file_path = None
             else:
                 logger.debug(f"qq_official 忽略 {i.type}")
-        return plain_text, image_base64, image_file_path, record_file_path
+        return plain_text, image_base64, image_file_path, record_file_path, video_file_path

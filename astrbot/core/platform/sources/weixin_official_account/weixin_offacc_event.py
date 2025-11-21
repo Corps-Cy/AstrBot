@@ -2,11 +2,11 @@ import asyncio
 import uuid
 
 from wechatpy import WeChatClient
-from wechatpy.replies import ImageReply, TextReply, VoiceReply
+from wechatpy.replies import ImageReply, TextReply, VoiceReply, VideoReply
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
-from astrbot.api.message_components import Image, Plain, Record
+from astrbot.api.message_components import Image, Plain, Record, Video
 from astrbot.api.platform import AstrBotMessage, PlatformMetadata
 
 try:
@@ -159,6 +159,44 @@ class WeixinOfficialAccountPlatformEvent(AstrMessageEvent):
                         )
                     else:
                         reply = VoiceReply(
+                            media_id=response["media_id"],
+                            message=self.message_obj.raw_message["message"],
+                        )
+                        xml = reply.render()
+                    future = self.message_obj.raw_message["future"]
+                    assert isinstance(future, asyncio.Future)
+                    future.set_result(xml)
+
+            elif isinstance(comp, Video):
+                video_path = await comp.convert_to_file_path()
+
+                with open(video_path, "rb") as f:
+                    try:
+                        response = self.client.media.upload("video", f)
+                    except Exception as e:
+                        logger.error(f"微信公众平台上传视频失败: {e}")
+                        await self.send(
+                            MessageChain().message(f"微信公众平台上传视频失败: {e}"),
+                        )
+                        return
+                    logger.debug(f"微信公众平台上传视频返回: {response}")
+
+                    if active_send_mode:
+                        # 微信公众号主动发送视频消息
+                        try:
+                            self.client.message.send_video(
+                                message_obj.sender.user_id,
+                                response["media_id"],
+                            )
+                        except AttributeError:
+                            # 如果 send_video 方法不存在，尝试使用 media_id 发送
+                            logger.warning("微信公众平台可能不支持主动发送视频消息")
+                            await self.send(
+                                MessageChain().message("微信公众平台不支持主动发送视频消息"),
+                            )
+                    else:
+                        # 被动回复视频消息
+                        reply = VideoReply(
                             media_id=response["media_id"],
                             message=self.message_obj.raw_message["message"],
                         )

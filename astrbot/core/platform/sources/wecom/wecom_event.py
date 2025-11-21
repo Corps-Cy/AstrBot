@@ -6,7 +6,7 @@ from wechatpy.enterprise import WeChatClient
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, MessageChain
-from astrbot.api.message_components import Image, Plain, Record
+from astrbot.api.message_components import Image, Plain, Record, Video
 from astrbot.api.platform import AstrBotMessage, PlatformMetadata
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
@@ -148,6 +148,24 @@ class WecomPlatformEvent(AstrMessageEvent):
                             self.get_self_id(),
                             response["media_id"],
                         )
+                elif isinstance(comp, Video):
+                    video_path = await comp.convert_to_file_path()
+
+                    with open(video_path, "rb") as f:
+                        try:
+                            response = self.client.media.upload("video", f)
+                        except Exception as e:
+                            logger.error(f"微信客服上传视频失败: {e}")
+                            await self.send(
+                                MessageChain().message(f"微信客服上传视频失败: {e}"),
+                            )
+                            return
+                        logger.debug(f"微信客服上传视频返回: {response}")
+                        kf_message_api.send_video(
+                            user_id,
+                            self.get_self_id(),
+                            response["media_id"],
+                        )
                 else:
                     logger.warning(f"还没实现这个消息类型的发送逻辑: {comp.type}。")
         else:
@@ -206,6 +224,31 @@ class WecomPlatformEvent(AstrMessageEvent):
                             message_obj.session_id,
                             response["media_id"],
                         )
+                elif isinstance(comp, Video):
+                    video_path = await comp.convert_to_file_path()
+
+                    with open(video_path, "rb") as f:
+                        try:
+                            response = self.client.media.upload("video", f)
+                        except Exception as e:
+                            logger.error(f"企业微信上传视频失败: {e}")
+                            await self.send(
+                                MessageChain().message(f"企业微信上传视频失败: {e}"),
+                            )
+                            return
+                        logger.debug(f"企业微信上传视频返回: {response}")
+                        # 企业微信应用发送视频消息
+                        try:
+                            self.client.message.send_video(
+                                message_obj.self_id,
+                                message_obj.session_id,
+                                response["media_id"],
+                            )
+                        except AttributeError:
+                            logger.warning("企业微信应用可能不支持发送视频消息")
+                            await self.send(
+                                MessageChain().message("企业微信应用不支持发送视频消息"),
+                            )
                 else:
                     logger.warning(f"还没实现这个消息类型的发送逻辑: {comp.type}。")
 
