@@ -196,11 +196,16 @@ class WeixinOfficialAccountPlatformEvent(AstrMessageEvent):
                             )
                     else:
                         # 被动回复视频消息
+                        # 微信公众号视频消息必须包含 title 和 description，否则会显示为 "Share Message"
                         reply = VideoReply(
                             media_id=response["media_id"],
                             message=self.message_obj.raw_message["message"],
                         )
+                        # 通过属性设置 title 和 description
+                        reply.title = "视频"
+                        reply.description = "视频消息"
                         xml = reply.render()
+                        logger.debug(f"视频消息 XML: {xml}")
                         future = self.message_obj.raw_message["future"]
                         assert isinstance(future, asyncio.Future)
                         future.set_result(xml)

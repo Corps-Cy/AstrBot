@@ -20,7 +20,10 @@ from astrbot.api.message_components import Image, Plain, Record, Video
 from astrbot.api.platform import AstrBotMessage, PlatformMetadata
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from astrbot.core.utils.io import download_image_by_url, file_to_base64
-from astrbot.core.utils.tencent_record_helper import wav_to_tencent_silk
+from astrbot.core.utils.tencent_record_helper import (
+    convert_to_pcm_wav,
+    wav_to_tencent_silk,
+)
 
 
 class QQOfficialMessageEvent(AstrMessageEvent):
@@ -337,8 +340,26 @@ class QQOfficialMessageEvent(AstrMessageEvent):
                 image_base64 = image_base64.removeprefix("base64://")
             elif isinstance(i, Record):
                 if i.file:
-                    record_wav_path = await i.convert_to_file_path()  # wav 路径
+                    record_audio_path = await i.convert_to_file_path()  # 可能是各种格式的音频路径
                     temp_dir = os.path.join(get_astrbot_data_path(), "temp")
+                    
+                    # 检查文件扩展名，如果不是 WAV 格式，需要先转换
+                    ext = os.path.splitext(record_audio_path)[1].lower()
+                    record_wav_path = record_audio_path
+                    
+                    if ext != ".wav":
+                        # 转换为 WAV 格式
+                        record_wav_path = os.path.join(
+                            temp_dir,
+                            f"{uuid.uuid4()}.wav",
+                        )
+                        try:
+                            await convert_to_pcm_wav(record_audio_path, record_wav_path)
+                        except Exception as e:
+                            logger.error(f"转换音频格式为 WAV 时出错: {e}")
+                            record_file_path = None
+                            continue
+                    
                     record_tecent_silk_path = os.path.join(
                         temp_dir,
                         f"{uuid.uuid4()}.silk",
