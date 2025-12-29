@@ -289,7 +289,7 @@ class Context:
         """获取所有用于 Embedding 任务的 Provider。"""
         return self.provider_manager.embedding_provider_insts
 
-    def get_using_provider(self, umo: str | None = None) -> Provider:
+    def get_using_provider(self, umo: str | None = None) -> Provider | None:
         """获取当前使用的用于文本生成任务的 LLM Provider(Chat_Completion 类型)。通过 /provider 指令切换。
 
         Args:
@@ -300,7 +300,7 @@ class Context:
             provider_type=ProviderType.CHAT_COMPLETION,
             umo=umo,
         )
-        if not isinstance(prov, Provider):
+        if prov and not isinstance(prov, Provider):
             raise ValueError("返回的 Provider 不是 Provider 类型")
         return prov
 
