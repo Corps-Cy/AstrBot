@@ -8,18 +8,19 @@ import re
 from collections.abc import AsyncGenerator
 
 from openai import AsyncAzureOpenAI, AsyncOpenAI
-from openai._exceptions import NotFoundError, UnprocessableEntityError
+from openai._exceptions import NotFoundError
 from openai.lib.streaming.chat._completions import ChatCompletionStreamState
 from openai.types.chat.chat_completion import ChatCompletion
 from openai.types.chat.chat_completion_chunk import ChatCompletionChunk
+from openai.types.completion_usage import CompletionUsage
 
 import astrbot.core.message.components as Comp
 from astrbot import logger
 from astrbot.api.provider import Provider
-from astrbot.core.agent.message import Message
+from astrbot.core.agent.message import ContentPart, ImageURLPart, Message, TextPart
 from astrbot.core.agent.tool import ToolSet
 from astrbot.core.message.message_event_result import MessageChain
-from astrbot.core.provider.entities import LLMResponse, ToolCallsResult
+from astrbot.core.provider.entities import LLMResponse, TokenUsage, ToolCallsResult
 from astrbot.core.utils.io import download_image_by_url
 
 from ..register import register_provider_adapter
@@ -68,8 +69,7 @@ class ProviderOpenAIOfficial(Provider):
             self.client.chat.completions.create,
         ).parameters.keys()
 
-        model_config = provider_config.get("model_config", {})
-        model = model_config.get("model", "unknown")
+        model = provider_config.get("model", "unknown")
         self.set_model(model)
 
         self.reasoning_key = "reasoning_content"
@@ -208,6 +208,7 @@ class ProviderOpenAIOfficial(Provider):
             # handle the content delta
             reasoning = self._extract_reasoning_content(chunk)
             _y = False
+            llm_response.id = chunk.id
             if reasoning:
                 llm_response.reasoning_content = reasoning
                 _y = True
@@ -217,6 +218,8 @@ class ProviderOpenAIOfficial(Provider):
                     chain=[Comp.Plain(completion_text)],
                 )
                 _y = True
+            if chunk.usage:
+                llm_response.usage = self._extract_usage(chunk.usage)
             if _y:
                 yield llm_response
 
@@ -244,6 +247,15 @@ class ProviderOpenAIOfficial(Provider):
             if reasoning_attr:
                 reasoning_text = str(reasoning_attr)
         return reasoning_text
+
+    def _extract_usage(self, usage: CompletionUsage) -> TokenUsage:
+        ptd = usage.prompt_tokens_details
+        cached = ptd.cached_tokens if ptd and ptd.cached_tokens else 0
+        return TokenUsage(
+            input_other=usage.prompt_tokens - cached,
+            input_cached=ptd.cached_tokens if ptd and ptd.cached_tokens else 0,
+            output=usage.completion_tokens,
+        )
 
     async def _parse_openai_completion(
         self, completion: ChatCompletion, tools: ToolSet | None
@@ -279,10 +291,15 @@ class ProviderOpenAIOfficial(Provider):
             args_ls = []
             func_name_ls = []
             tool_call_ids = []
+            tool_call_extra_content_dict = {}
             for tool_call in choice.message.tool_calls:
                 if isinstance(tool_call, str):
                     # workaround for #1359
                     tool_call = json.loads(tool_call)
+                if tools is None:
+                    # 工具集未提供
+                    # Should be unreachable
+                    raise Exception("工具集未提供")
                 for tool in tools.func_list:
                     if (
                         tool_call.type == "function"
@@ -296,11 +313,16 @@ class ProviderOpenAIOfficial(Provider):
                         args_ls.append(args)
                         func_name_ls.append(tool_call.function.name)
                         tool_call_ids.append(tool_call.id)
+
+                        # gemini-2.5 / gemini-3 series extra_content handling
+                        extra_content = getattr(tool_call, "extra_content", None)
+                        if extra_content is not None:
+                            tool_call_extra_content_dict[tool_call.id] = extra_content
             llm_response.role = "tool"
             llm_response.tools_call_args = args_ls
             llm_response.tools_call_name = func_name_ls
             llm_response.tools_call_ids = tool_call_ids
-
+            llm_response.tools_call_extra_content = tool_call_extra_content_dict
         # specially handle finish reason
         if choice.finish_reason == "content_filter":
             raise Exception(
@@ -311,6 +333,10 @@ class ProviderOpenAIOfficial(Provider):
             raise Exception(f"API 返回的 completion 无法解析：{completion}。")
 
         llm_response.raw_completion = completion
+        llm_response.id = completion.id
+
+        if completion.usage:
+            llm_response.usage = self._extract_usage(completion.usage)
 
         return llm_response
 
@@ -322,6 +348,7 @@ class ProviderOpenAIOfficial(Provider):
         system_prompt: str | None = None,
         tool_calls_result: ToolCallsResult | list[ToolCallsResult] | None = None,
         model: str | None = None,
+        extra_user_content_parts: list[ContentPart] | None = None,
         **kwargs,
     ) -> tuple:
         """准备聊天所需的有效载荷和上下文"""
@@ -329,7 +356,9 @@ class ProviderOpenAIOfficial(Provider):
             contexts = []
         new_record = None
         if prompt is not None:
-            new_record = await self.assemble_context(prompt, image_urls)
+            new_record = await self.assemble_context(
+                prompt, image_urls, extra_user_content_parts
+            )
         context_query = self._ensure_message_to_dicts(contexts)
         if new_record:
             context_query.append(new_record)
@@ -348,12 +377,11 @@ class ProviderOpenAIOfficial(Provider):
                 for tcr in tool_calls_result:
                     context_query.extend(tcr.to_openai_messages())
 
-        model_config = self.provider_config.get("model_config", {})
-        model_config["model"] = model or self.get_model()
+        model = model or self.get_model()
 
-        payloads = {"messages": context_query, **model_config}
+        payloads = {"messages": context_query, "model": model}
 
-        # xAI 原生搜索参数（最小侵入地在此处注入）
+        # xAI origin search tool inject
         self._maybe_inject_xai_search(payloads, **kwargs)
 
         return payloads, context_query
@@ -427,7 +455,7 @@ class ProviderOpenAIOfficial(Provider):
             )
             payloads.pop("tools", None)
             return False, chosen_key, available_api_keys, payloads, context_query, None
-        logger.error(f"发生了错误。Provider 配置如下: {self.provider_config}")
+        # logger.error(f"发生了错误。Provider 配置如下: {self.provider_config}")
 
         if "tool" in str(e).lower() and "support" in str(e).lower():
             logger.error("疑似该模型不支持函数调用工具调用。请输入 /tool off_all")
@@ -451,6 +479,7 @@ class ProviderOpenAIOfficial(Provider):
         system_prompt=None,
         tool_calls_result=None,
         model=None,
+        extra_user_content_parts=None,
         **kwargs,
     ) -> LLMResponse:
         payloads, context_query = await self._prepare_chat_payload(
@@ -460,6 +489,7 @@ class ProviderOpenAIOfficial(Provider):
             system_prompt,
             tool_calls_result,
             model=model,
+            extra_user_content_parts=extra_user_content_parts,
             **kwargs,
         )
 
@@ -475,12 +505,6 @@ class ProviderOpenAIOfficial(Provider):
                 self.client.api_key = chosen_key
                 llm_response = await self._query(payloads, func_tool)
                 break
-            except UnprocessableEntityError as e:
-                logger.warning(f"不可处理的实体错误：{e}，尝试删除图片。")
-                # 尝试删除所有 image
-                new_contexts = await self._remove_image_from_context(context_query)
-                payloads["messages"] = new_contexts
-                context_query = new_contexts
             except Exception as e:
                 last_exception = e
                 (
@@ -545,12 +569,6 @@ class ProviderOpenAIOfficial(Provider):
                 async for response in self._query_stream(payloads, func_tool):
                     yield response
                 break
-            except UnprocessableEntityError as e:
-                logger.warning(f"不可处理的实体错误：{e}，尝试删除图片。")
-                # 尝试删除所有 image
-                new_contexts = await self._remove_image_from_context(context_query)
-                payloads["messages"] = new_contexts
-                context_query = new_contexts
             except Exception as e:
                 last_exception = e
                 (
@@ -611,33 +629,71 @@ class ProviderOpenAIOfficial(Provider):
         self,
         text: str,
         image_urls: list[str] | None = None,
+        extra_user_content_parts: list[ContentPart] | None = None,
     ) -> dict:
         """组装成符合 OpenAI 格式的 role 为 user 的消息段"""
-        if image_urls:
-            user_content = {
-                "role": "user",
-                "content": [{"type": "text", "text": text if text else "[图片]"}],
+
+        async def resolve_image_part(image_url: str) -> dict | None:
+            if image_url.startswith("http"):
+                image_path = await download_image_by_url(image_url)
+                image_data = await self.encode_image_bs64(image_path)
+            elif image_url.startswith("file:///"):
+                image_path = image_url.replace("file:///", "")
+                image_data = await self.encode_image_bs64(image_path)
+            else:
+                image_data = await self.encode_image_bs64(image_url)
+            if not image_data:
+                logger.warning(f"图片 {image_url} 得到的结果为空，将忽略。")
+                return None
+            return {
+                "type": "image_url",
+                "image_url": {"url": image_data},
             }
-            for image_url in image_urls:
-                if image_url.startswith("http"):
-                    image_path = await download_image_by_url(image_url)
-                    image_data = await self.encode_image_bs64(image_path)
-                elif image_url.startswith("file:///"):
-                    image_path = image_url.replace("file:///", "")
-                    image_data = await self.encode_image_bs64(image_path)
+
+        # 构建内容块列表
+        content_blocks = []
+
+        # 1. 用户原始发言（OpenAI 建议：用户发言在前）
+        if text:
+            content_blocks.append({"type": "text", "text": text})
+        elif image_urls:
+            # 如果没有文本但有图片，添加占位文本
+            content_blocks.append({"type": "text", "text": "[图片]"})
+        elif extra_user_content_parts:
+            # 如果只有额外内容块，也需要添加占位文本
+            content_blocks.append({"type": "text", "text": " "})
+
+        # 2. 额外的内容块（系统提醒、指令等）
+        if extra_user_content_parts:
+            for part in extra_user_content_parts:
+                if isinstance(part, TextPart):
+                    content_blocks.append({"type": "text", "text": part.text})
+                elif isinstance(part, ImageURLPart):
+                    image_part = await resolve_image_part(part.image_url.url)
+                    if image_part:
+                        content_blocks.append(image_part)
                 else:
-                    image_data = await self.encode_image_bs64(image_url)
-                if not image_data:
-                    logger.warning(f"图片 {image_url} 得到的结果为空，将忽略。")
-                    continue
-                user_content["content"].append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": image_data},
-                    },
-                )
-            return user_content
-        return {"role": "user", "content": text}
+                    raise ValueError(f"不支持的额外内容块类型: {type(part)}")
+
+        # 3. 图片内容
+        if image_urls:
+            for image_url in image_urls:
+                image_part = await resolve_image_part(image_url)
+                if image_part:
+                    content_blocks.append(image_part)
+
+        # 如果只有主文本且没有额外内容块和图片，返回简单格式以保持向后兼容
+        if (
+            text
+            and not extra_user_content_parts
+            and not image_urls
+            and len(content_blocks) == 1
+            and content_blocks[0]["type"] == "text"
+        ):
+            return {"role": "user", "content": content_blocks[0]["text"]}
+
+        # 否则返回多模态格式
+        return {"role": "user", "content": content_blocks}
 
     async def encode_image_bs64(self, image_url: str) -> str:
         """将图片转换为 base64"""
@@ -646,4 +702,3 @@ class ProviderOpenAIOfficial(Provider):
         with open(image_url, "rb") as f:
             image_bs64 = base64.b64encode(f.read()).decode("utf-8")
             return "data:image/jpeg;base64," + image_bs64
-        return ""
